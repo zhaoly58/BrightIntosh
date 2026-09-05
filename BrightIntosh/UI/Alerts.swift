@@ -218,26 +218,95 @@ private func presentForegroundAlert(
 }
 
 @MainActor
-func presentBrightnessFailurePrompt(reason: String) async {
-    SupportReportContext.lastBrightnessFailureReason = reason
-    
-    let response = await presentForegroundAlert(
-        style: .warning,
-        title: String(localized: "Sorry, BrightIntosh could not reliably increase brightness on this Mac"),
-        message: String(localized: "Please share anonymous diagnostics so we can look into this brightness issue. The report only includes BrightIntosh data and your running processes, and we'll only use it to investigate this problem."),
-        buttonTitles: [
-            String(localized: "Send Anonymous Diagnostics"),
-            String(localized: "Not Now"),
-        ]
-    )
+private final class BrightnessFailurePromptCoordinator {
+    static let shared = BrightnessFailurePromptCoordinator()
 
-    guard response == .alertFirstButtonReturn else { return }
-    let report = await generateReport(includeRunningApplications: true)
-    do {
-        try await sendDiagnosticsReport(report)
-    } catch {
-        copyDiagnosticsToClipboard(report)
-        await showDiagnosticsSendFailedAlert()
+    private let promptVersionKey = "brightnessFailurePromptVersion"
+    private let promptDateKey = "brightnessFailurePromptDate"
+    private var isPresenting = false
+    private var activeReasons: [String] = []
+
+    func present(reason: String) async {
+        if isPresenting {
+            appendActiveReason(reason)
+            BrightnessDiagnosticHistory.record(
+                "Coalesced duplicate brightness failure prompt while one was already active: \(reason)"
+            )
+            return
+        }
+
+        let defaults = BrightIntoshSettings.defaults
+        let lastPromptDate = defaults.object(forKey: promptDateKey) as? Date ?? .distantPast
+        guard defaults.string(forKey: promptVersionKey) != appVersion,
+              Date().timeIntervalSince(lastPromptDate) >= 7 * 24 * 60 * 60 else {
+            SupportReportContext.lastBrightnessFailureReason = reason
+            BrightnessDiagnosticHistory.record(
+                "Brightness failure prompt suppressed by version/weekly limit: \(reason)"
+            )
+            return
+        }
+
+        // Reserve before presenting: declining, restarting, or a failed send must not prompt again.
+        defaults.set(appVersion, forKey: promptVersionKey)
+        defaults.set(Date(), forKey: promptDateKey)
+        isPresenting = true
+        activeReasons = []
+        appendActiveReason(reason)
+        defer {
+            isPresenting = false
+            activeReasons = []
+        }
+
+        let response = await presentForegroundAlert(
+            style: .warning,
+            title: String(localized: "Sorry, BrightIntosh could not reliably increase brightness on this Mac"),
+            message: String(localized: "Please share anonymous diagnostics so we can look into this brightness issue. The report only includes BrightIntosh data and your running processes, and we'll only use it to investigate this problem."),
+            buttonTitles: [
+                String(localized: "Send Anonymous Diagnostics"),
+                String(localized: "Not Now"),
+            ]
+        )
+
+        guard response == .alertFirstButtonReturn else { return }
+        updateSupportReportReason()
+        let report = await generateReport(includeRunningApplications: true)
+        do {
+            try await sendDiagnosticsReport(report)
+        } catch {
+            copyDiagnosticsToClipboard(report)
+            await showDiagnosticsSendFailedAlert()
+        }
+    }
+
+    private func appendActiveReason(_ reason: String) {
+        if !activeReasons.contains(reason) {
+            activeReasons.append(reason)
+        }
+        updateSupportReportReason()
+    }
+
+    private func updateSupportReportReason() {
+        SupportReportContext.lastBrightnessFailureReason = activeReasons.joined(
+            separator: " | "
+        )
+    }
+}
+
+@MainActor
+func presentBrightnessFailurePrompt(reason: String) async {
+    await BrightnessFailurePromptCoordinator.shared.present(reason: reason)
+}
+
+@MainActor
+func scheduleBrightnessFailurePrompt(reason: String, while isStillFailing: @escaping @MainActor () -> Bool) {
+    Task { @MainActor in
+        // Brief outages and failures resolved by a user action should never interrupt the user.
+        for _ in 0..<60 {
+            guard isStillFailing() else { return }
+            try? await Task.sleep(for: .seconds(2))
+        }
+        guard isStillFailing() else { return }
+        await presentBrightnessFailurePrompt(reason: reason)
     }
 }
 
